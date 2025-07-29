@@ -1,0 +1,168 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Remote Web Control - Viewer</title>
+  <style>
+    html, body { height:100%; margin:0; background:#0b1220; color:#e6e8ee; font-family: system-ui, Arial, sans-serif; }
+    .topbar { display:flex; align-items:center; gap:12px; padding:10px 14px; background:#0e1627; border-bottom:1px solid #2b395b; }
+    .pill { padding:6px 10px; border-radius:999px; background:#121a2b; border:1px solid #2b395b; font-size:12px; }
+    .btn { padding:8px 12px; border-radius:10px; background:#1d63ff; color:#fff; border:none; cursor:pointer; font-weight:600; }
+    .danger { background:#d64545; }
+    .content { height: calc(100% - 50px); display:flex; }
+    #canvas { flex:1; display:block; background:#000; width:100%; height:100%; }
+    .status { font-size:12px; color:#9fb0d6; margin-left:auto; }
+    .controls { display:flex; align-items:center; gap:10px; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="pill">Local session</div>
+    <div class="controls">
+      <label class="pill"><input type="checkbox" id="viewOnly" checked/> View only</label>
+      <button class="btn" onclick="logout()">Logout</button>
+    </div>
+    <div class="status" id="status">Connecting...</div>
+  </div>
+  <div class="content">
+    <canvas id="canvas" tabindex="0"></canvas>
+  </div>
+  <script>
+    const statusEl = document.getElementById('status');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    let ws;
+    let remoteW = 0, remoteH = 0;
+    let viewOnly = true;
+    let lastMove = 0;
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight - 50;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    document.getElementById('viewOnly').addEventListener('change', (e) => {
+      viewOnly = e.target.checked;
+      canvas.focus();
+    });
+
+    function logout() {
+      fetch('/logout').then(() => location.href = '/login');
+    }
+
+    function normXY(clientX, clientY) {
+      const imgW = remoteW, imgH = remoteH;
+      if (!imgW || !imgH) return {nx:0, ny:0};
+      const scale = Math.min(canvas.width / imgW, canvas.height / imgH);
+      const dispW = imgW * scale, dispH = imgH * scale;
+      const offX = (canvas.width - dispW) / 2;
+      const offY = (canvas.height - dispH) / 2;
+      let x = (clientX - offX) / dispW;
+      let y = (clientY - offY) / dispH;
+      x = Math.max(0, Math.min(1, x));
+      y = Math.max(0, Math.min(1, y));
+      return {nx: x, ny: y};
+    }
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (viewOnly) return;
+      const now = performance.now();
+      if (now - lastMove < 25) return; // throttle ~40 Hz
+      lastMove = now;
+      const rect = canvas.getBoundingClientRect();
+      const {nx, ny} = normXY(e.clientX - rect.left, e.clientY - rect.top);
+      sendInput({type:'input', device:'mouse', etype:'move', nx, ny});
+    });
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (viewOnly) return;
+      const rect = canvas.getBoundingClientRect();
+      const {nx, ny} = normXY(e.clientX - rect.left, e.clientY - rect.top);
+      const button = (e.button === 0) ? 'left' : 'right';
+      sendInput({type:'input', device:'mouse', etype:'click', nx, ny, button, pressed:true});
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      if (viewOnly) return;
+      const rect = canvas.getBoundingClientRect();
+      const {nx, ny} = normXY(e.clientX - rect.left, e.clientY - rect.top);
+      const button = (e.button === 0) ? 'left' : 'right';
+      sendInput({type:'input', device:'mouse', etype:'click', nx, ny, button, pressed:false});
+    });
+
+    canvas.addEventListener('wheel', (e) => {
+      if (viewOnly) return;
+      e.preventDefault();
+      const dx = Math.sign(e.deltaX);
+      const dy = Math.sign(e.deltaY);
+      sendInput({type:'input', device:'mouse', etype:'scroll', dx, dy});
+    }, {passive:false});
+
+    canvas.addEventListener('keydown', (e) => {
+      if (viewOnly) return;
+      // Printable character?
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        sendInput({type:'input', device:'keyboard', etype:'text', text:e.key});
+      } else {
+        const k = mapKeyName(e.key);
+        if (k) sendInput({type:'input', device:'keyboard', etype:'keydown', key:k});
+      }
+      e.preventDefault();
+    });
+
+    canvas.addEventListener('keyup', (e) => {
+      if (viewOnly) return;
+      const k = mapKeyName(e.key);
+      if (k) sendInput({type:'input', device:'keyboard', etype:'keyup', key:k});
+      e.preventDefault();
+    });
+
+    function mapKeyName(k) {
+      const m = {
+        'Enter':'enter','Backspace':'backspace','Tab':'tab','Escape':'escape',
+        'ArrowUp':'up','ArrowDown':'down','ArrowLeft':'left','ArrowRight':'right',
+        'Delete':'delete','Home':'home','End':'end','PageUp':'pageup','PageDown':'pagedown'
+      };
+      return m[k] || null;
+    }
+
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(proto + '://' + location.host + '/ws');
+      ws.binaryType = 'blob';
+      ws.onopen = () => { statusEl.textContent = 'Connected'; canvas.focus(); };
+      ws.onclose = () => { statusEl.textContent = 'Disconnected. Reconnecting in 2s...'; setTimeout(connectWS, 2000); };
+      ws.onerror = () => { statusEl.textContent = 'WebSocket error'; };
+      ws.onmessage = async (ev) => {
+        if (typeof ev.data === 'string') {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'info') {
+              remoteW = msg.screen_w; remoteH = msg.screen_h;
+            }
+          } catch (_) {}
+        } else {
+          // Blob (JPEG)
+          const bmp = await createImageBitmap(ev.data);
+          // Fit center with letterboxing
+          ctx.clearRect(0,0,canvas.width,canvas.height);
+          const scale = Math.min(canvas.width / bmp.width, canvas.height / bmp.height);
+          const dw = bmp.width * scale, dh = bmp.height * scale;
+          const dx = (canvas.width - dw) / 2;
+          const dy = (canvas.height - dh) / 2;
+          ctx.drawImage(bmp, dx, dy, dw, dh);
+        }
+      };
+    }
+
+    function sendInput(obj) {
+      try { ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(obj)); } catch(e){}
+    }
+
+    connectWS();
+  </script>
+</body>
+</html>
